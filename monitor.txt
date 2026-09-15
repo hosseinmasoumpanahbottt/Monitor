@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+# ============================================================
+# 🤖 REZA POSITION MONITOR - نسخه شیک و مرتب
+# ============================================================
+
+import os
+import time
+import hmac
+import hashlib
+import logging
+import json
+from datetime import datetime, timezone, timedelta
+import requests
+
+# ============================================================
+# تنظیمات
+# ============================================================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+XT_API_KEY = os.getenv("XT_API_KEY", "").strip()
+XT_API_SECRET = os.getenv("XT_API_SECRET", "").strip()
+XT_BASE_URL = "https://fapi.xt.com"
+STATE_FILE = "sent_positions.json"
+
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+# ============================================================
+# لاگ
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("REZA-MONITOR")
+
+# ============================================================
+# مدیریت فایل وضعیت
+# ============================================================
+
+def load_sent():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return set(json.load(f).get("sent", []))
+    except:
+        return set()
+
+def save_sent(sent_set):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"sent": list(sent_set)}, f)
+    except:
+        pass
+
+# ============================================================
+# توابع XT
+# ============================================================
+
+def canonical_form(params):
+    if not params:
+        return ""
+    pairs = []
+    for key in sorted(params.keys()):
+        value = params[key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        pairs.append(f"{key}={value}")
+    return "&".join(pairs)
+
+def calculate_signature(api_key, api_secret, timestamp, path, query_string="", body_string=""):
+    x = "xt-validate-appkey=" + str(api_key) + "&xt-validate-timestamp=" + str(timestamp)
+    parts = [path]
+    if query_string:
+        parts.append(query_string)
+    if body_string:
+        parts.append(body_string)
+    y = "#".join(parts)
+    original = x + "#" + y
+    return hmac.new(
+        api_secret.encode("utf-8"),
+        original.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+def xt_private_get(path, params=None):
+    params = params or {}
+    timestamp = str(int(time.time() * 1000))
+    query_string = canonical_form(params)
+    signature = calculate_signature(
+        XT_API_KEY,
+        XT_API_SECRET,
+        timestamp,
+        path,
+        query_string=query_string,
+        body_string=""
+    )
+    
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "xt-validate-appkey": XT_API_KEY,
+        "xt-validate-timestamp": timestamp,
+        "xt-validate-signature": signature,
+        "xt-validate-recvwindow": "5000",
+        "xt-validate-algorithms": "HmacSHA256",
+        "xt-validate-signversion": "1.0"
+    }
+    
+    response = requests.get(XT_BASE_URL + path, params=params, headers=headers, timeout=10)
+    if response.status_code >= 400:
+        raise RuntimeError(f"XT HTTP {response.status_code}: {response.text[:500]}")
+    data = response.json()
+    rc = data.get("returnCode")
+    if rc not in (None, 0, "0"):
+        raise RuntimeError(f"XT API error: {data}")
+    return data
+
+def get_xt_positions():
+    try:
+        response = xt_private_get("/future/user/v1/position/list", {})
+        result = response.get("result", [])
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return result.get("list", [])
+        return []
+    except Exception as exc:
+        log.error(f"XT position error: {exc}")
+        return []
+
+# ============================================================
+# دریافت قیمت ۶ ارز
+# ============================================================
+
+SYMBOLS = [
+    {"name": "BTC", "symbol": "btc_usdt", "emoji": "₿"},
+    {"name": "ETH", "symbol": "eth_usdt", "emoji": "⟠"},
+    {"name": "BNB", "symbol": "bnb_usdt", "emoji": "🔶"},
+    {"name": "XRP", "symbol": "xrp_usdt", "emoji": "💠"},
+    {"name": "ADA", "symbol": "ada_usdt", "emoji": "🔴"},
+    {"name": "PAXG", "symbol": "paxg_usdt", "emoji": "🥇"}
+]
+
+def get_prices():
+    prices = []
+    for item in SYMBOLS:
+        try:
+            response = requests.get(
+                f"{XT_BASE_URL}/future/market/v1/public/q/agg-ticker",
+                params={"symbol": item["symbol"]},
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                result = data.get("result", {})
+                price = result.get("c")
+                if price:
+                    prices.append({
+                        "name": item["name"],
+                        "emoji": item["emoji"],
+                        "price": float(price)
+                    })
+                else:
+                    prices.append({
+                        "name": item["name"],
+                        "emoji": item["emoji"],
+                        "price": 0
+                    })
+            else:
+                prices.append({
+                    "name": item["name"],
+                    "emoji": item["emoji"],
+                    "price": 0
+                })
+            time.sleep(0.1)
+        except Exception as e:
+            log.warning(f"Price error for {item['name']}: {e}")
+            prices.append({
+                "name": item["name"],
+                "emoji": item["emoji"],
+                "price": 0
+            })
+    return prices
+
+# ============================================================
+# توابع تلگرام
+# ============================================================
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            log.info("✅ Telegram sent")
+            return True
+        else:
+            log.error(f"❌ Telegram error: {response.text}")
+            return False
+    except Exception as e:
+        log.error(f"❌ Telegram exception: {e}")
+        return False
+
+# ============================================================
+# ساخت پیام شیک و مرتب
+# ============================================================
+
+def format_full_message(pos, prices, is_new=True):
+    side = pos.get("positionSide", "UNKNOWN")
+    entry = float(pos.get("entryPrice", 0) or 0)
+    stop = float(pos.get("stopPrice", 0) or 0)
+    tp = float(pos.get("takeProfit", 0) or 0)
+    lev = int(pos.get("leverage", 0) or 0)
+    symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
+    
+    pnl_pct = 3.0 if side == "LONG" else -3.0
+    side_emoji = "🟢" if side == "LONG" else "🔴"
+    direction_text = "لانگ (خرید)" if side == "LONG" else "شورت (فروش)"
+    
+    now_iran = datetime.now(IRAN_TZ)
+    time_str = now_iran.strftime('%Y-%m-%d %H:%M:%S')
+    
+    line = "━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    # ساخت بخش قیمت‌ها
+    price_lines = []
+    for item in prices:
+        price = item["price"]
+        if price > 0:
+            price_str = f"{price:,.2f}"
+        else:
+            price_str = "N/A"
+        price_lines.append(f"{item['emoji']} <b>{item['name']}</b>  →  <code>{price_str}</code>")
+    
+    price_section = "\n".join(price_lines)
+    
+    # عنوان
+    title = "🆕 <b>پوزیشن جدید</b>" if is_new else "📊 <b>پوزیشن</b>"
+    
+    msg = f"""{title}
+
+{line}
+{side_emoji} <b>{symbol}</b>  |  <b>{direction_text}</b>
+{line}
+
+💰 <b>قیمت ورود:</b>  <code>{entry:.2f}</code> USDT
+🛑 <b>حد ضرر:</b>  <code>{stop:.2f}</code> USDT
+🎯 <b>حد سود:</b>  <code>{tp:.2f}</code> USDT
+📦 <b>حجم:</b>  <code>1</code>
+⚡ <b>اهرم:</b>  <code>{lev}x</code>
+📈 <b>سود/زیان:</b>  <b>{pnl_pct:+.2f}%</b>
+
+{line}
+💵 <b>قیمت لحظه‌ای ارزها</b>
+{line}
+
+{price_section}
+
+{line}
+🕐 <code>{time_str}</code>
+📌 <i>مدیریت سرمایه و پوزیشن با شماست</i>"""
+    
+    return msg
+
+# ============================================================
+# تابع اصلی (یک بار اجرا)
+# ============================================================
+
+def main():
+    log.info("🚀 Starting monitor (one-shot)...")
+    
+    try:
+        # 1. بارگذاری لیست ارسال‌شده‌ها
+        sent = load_sent()
+        log.info(f"📌 Loaded {len(sent)} sent positions")
+        
+        # 2. دریافت پوزیشن‌ها
+        positions = get_xt_positions()
+        current = {}
+        
+        for pos in positions:
+            size = float(pos.get("positionSize", 0) or 0)
+            if size > 0:
+                symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
+                side = pos.get("positionSide", "UNKNOWN")
+                entry = float(pos.get("entryPrice", 0) or 0)
+                # کلید یکتا: symbol + side + entry
+                key = f"{symbol}_{side}_{entry:.2f}"
+                current[key] = pos
+        
+        # 3. ارسال پوزیشن‌های جدید
+        new_count = 0
+        for key, pos in current.items():
+            if key not in sent:
+                log.info(f"🆕 New position: {key}")
+                prices = get_prices()
+                msg = format_full_message(pos, prices, is_new=True)
+                send_telegram(msg)
+                sent.add(key)
+                save_sent(sent)
+                new_count += 1
+                time.sleep(0.5)
+            else:
+                log.info(f"⏸️ Already sent: {key}")
+        
+        # 4. حذف پوزیشن‌های بسته شده از لیست
+        removed = False
+        for key in list(sent):
+            if key not in current:
+                log.info(f"🔒 Position closed: {key}")
+                sent.discard(key)
+                removed = True
+        if removed:
+            save_sent(sent)
+        
+        log.info(f"✅ Done. New: {new_count}, Active: {len(current)}")
+        
+    except Exception as exc:
+        log.error(f"❌ Error: {exc}")
+
+
+if __name__ == "__main__":
+    main()
