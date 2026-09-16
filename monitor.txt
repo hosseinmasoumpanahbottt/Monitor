@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+# ============================================================
+# 🤖 REZA POSITION MONITOR - فقط پوزیشن‌های تازه
+# ============================================================
+
+import os
+import time
+import hmac
+import hashlib
+import logging
+from datetime import datetime, timezone, timedelta
+import requests
+
+# ============================================================
+# تنظیمات
+# ============================================================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+XT_API_KEY = os.getenv("XT_API_KEY", "").strip()
+XT_API_SECRET = os.getenv("XT_API_SECRET", "").strip()
+XT_BASE_URL = "https://fapi.xt.com"
+
+CHECK_INTERVAL = 120          # هر ۲ دقیقه
+MAX_AGE_SECONDS = 120         # فقط پوزیشن‌هایی که زیر ۲ دقیقه از آخرین بروزرسانی‌شون گذشته
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+# ============================================================
+# 🧠 حافظه داخلی (برای جلوگیری از تکرار)
+# ============================================================
+
+seen_positions = set()
+
+# ============================================================
+# لاگ
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+log = logging.getLogger("REZA-MONITOR")
+
+# ============================================================
+# توابع XT
+# ============================================================
+
+def canonical_form(params):
+    if not params:
+        return ""
+    pairs = []
+    for key in sorted(params.keys()):
+        value = params[key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = "true" if value else "false"
+        pairs.append(f"{key}={value}")
+    return "&".join(pairs)
+
+def calculate_signature(api_key, api_secret, timestamp, path, query_string="", body_string=""):
+    x = "xt-validate-appkey=" + str(api_key) + "&xt-validate-timestamp=" + str(timestamp)
+    parts = [path]
+    if query_string:
+        parts.append(query_string)
+    if body_string:
+        parts.append(body_string)
+    y = "#".join(parts)
+    original = x + "#" + y
+    return hmac.new(
+        api_secret.encode("utf-8"),
+        original.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+def xt_private_get(path, params=None):
+    params = params or {}
+    timestamp = str(int(time.time() * 1000))
+    query_string = canonical_form(params)
+    signature = calculate_signature(
+        XT_API_KEY, XT_API_SECRET, timestamp, path,
+        query_string=query_string, body_string=""
+    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "xt-validate-appkey": XT_API_KEY,
+        "xt-validate-timestamp": timestamp,
+        "xt-validate-signature": signature,
+        "xt-validate-recvwindow": "5000",
+        "xt-validate-algorithms": "HmacSHA256",
+        "xt-validate-signversion": "1.0"
+    }
+    response = requests.get(XT_BASE_URL + path, params=params, headers=headers, timeout=10)
+    if response.status_code >= 400:
+        raise RuntimeError(f"XT HTTP {response.status_code}: {response.text[:500]}")
+    data = response.json()
+    rc = data.get("returnCode")
+    if rc not in (None, 0, "0"):
+        raise RuntimeError(f"XT API error: {data}")
+    return data
+
+def get_xt_positions():
+    try:
+        response = xt_private_get("/future/user/v1/position/list", {})
+        result = response.get("result", [])
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return result.get("list", [])
+        return []
+    except Exception as exc:
+        log.error(f"XT position error: {exc}")
+        return []
+
+# ============================================================
+# تلگرام
+# ============================================================
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        r = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=5)
+        if r.status_code == 200:
+            log.info("✅ Telegram sent")
+            return True
+        else:
+            log.error(f"❌ Telegram error: {r.text}")
+            return False
+    except Exception as e:
+        log.error(f"❌ Telegram exception: {e}")
+        return False
+
+# ============================================================
+# فرمت پیام
+# ============================================================
+
+def format_position_message(pos):
+    side = pos.get("positionSide", "UNKNOWN")
+    entry = float(pos.get("entryPrice", 0) or 0)
+    lev = int(pos.get("leverage", 0) or 0)
+    symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
+    
+    pnl_pct = 3.0 if side == "LONG" else -3.0
+    side_emoji = "🟢" if side == "LONG" else "🔴"
+    direction_text = "لانگ (خرید)" if side == "LONG" else "شورت (فروش)"
+    
+    now_iran = datetime.now(IRAN_TZ)
+    time_str = now_iran.strftime('%Y-%m-%d %H:%M:%S')
+    
+    line = "━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    return f"""🆕 <b>پوزیشن جدید</b>
+
+{line}
+{side_emoji} <b>{symbol}</b>  |  <b>{direction_text}</b>
+{line}
+
+💰 <b>قیمت ورود:</b>  <code>{entry:.2f}</code> USDT
+🛑 <b>حد ضرر:</b>  <code>0.00</code> USDT
+🎯 <b>حد سود:</b>  <code>0.00</code> USDT
+📦 <b>حجم:</b>  <code>1</code>
+⚡ <b>اهرم:</b>  <code>{lev}x</code>
+📈 <b>سود/زیان:</b>  <b>{pnl_pct:+.2f}%</b>
+
+{line}
+🕐 <code>{time_str}</code>
+📌 <i>مدیریت سرمایه و پوزیشن با شماست</i>"""
+
+# ============================================================
+# یک بار چک
+# ============================================================
+
+def check_once():
+    global seen_positions
+    
+    try:
+        now = time.time()
+        positions = get_xt_positions()
+        current_keys = set()
+        
+        for pos in positions:
+            size = float(pos.get("positionSize", 0) or 0)
+            if size <= 0:
+                continue
+            
+            symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
+            side = pos.get("positionSide", "UNKNOWN")
+            entry = float(pos.get("entryPrice", 0) or 0)
+            key = f"{symbol}_{side}"
+            current_keys.add(key)
+            
+            # ⏰ بررسی زمان با updatedTime
+            updated_ms = pos.get("updatedTime")
+            age_seconds = None
+            
+            if updated_ms:
+                try:
+                    ts = int(updated_ms)
+                    if ts > 1e12:
+                        ts = ts / 1000
+                    age_seconds = now - ts
+                except:
+                    pass
+            
+            log.info(f"🔍 {key} | Entry: {entry} | Age: {age_seconds:.0f}s" if age_seconds else f"🔍 {key} | Entry: {entry} | Age: unknown")
+            
+            # ✅ شرط ارسال: هم پوزیشن جدید باشه، هم تازه باشه
+            if key not in seen_positions:
+                # پوزیشن جدید توی حافظه
+                if age_seconds is None or age_seconds <= MAX_AGE_SECONDS:
+                    log.info(f"🆕 Fresh: {key} → Sending")
+                    send_telegram(format_position_message(pos))
+                    seen_positions.add(key)
+                    time.sleep(0.5)
+                else:
+                    log.info(f"⏸️ Old position ({age_seconds:.0f}s), skipping")
+                    seen_positions.add(key)  # ذخیره میکنیم که دیگه چک نشه
+            else:
+                log.info(f"⏸️ Already sent: {key}")
+        
+        # 🧹 حذف پوزیشن‌های بسته شده
+        closed = seen_positions - current_keys
+        if closed:
+            log.info(f"🧹 Closed: {closed}")
+            seen_positions -= closed
+        
+        log.info(f"📊 Active: {len(current_keys)} | Memory: {len(seen_positions)}")
+        
+    except Exception as exc:
+        log.error(f"❌ Error: {exc}")
+
+# ============================================================
+# حلقه اصلی
+# ============================================================
+
+def main():
+    log.info("🚀 Starting monitor...")
+    while True:
+        try:
+            check_once()
+        except Exception as exc:
+            log.error(f"❌ Loop error: {exc}")
+        log.info(f"⏳ Sleeping {CHECK_INTERVAL}s...")
+        time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped.")
+    except Exception as exc:
+        print(f"❌ Fatal: {exc}")
