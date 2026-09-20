@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-# 🤖 REZA POSITION MONITOR - نسخه نهایی
+# 🤖 REZA POSITION MONITOR - نسخه نهایی با استاپ/تی‌پی
 # ============================================================
 
 import os
@@ -25,20 +25,9 @@ CHECK_INTERVAL = 120
 MAX_AGE_SECONDS = 120
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
-# ============================================================
-# 🧠 حافظه داخلی
-# ============================================================
-
 seen_positions = set()
 
-# ============================================================
-# لاگ
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("REZA-MONITOR")
 
 # ============================================================
@@ -67,20 +56,13 @@ def calculate_signature(api_key, api_secret, timestamp, path, query_string="", b
         parts.append(body_string)
     y = "#".join(parts)
     original = x + "#" + y
-    return hmac.new(
-        api_secret.encode("utf-8"),
-        original.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    return hmac.new(api_secret.encode("utf-8"), original.encode("utf-8"), hashlib.sha256).hexdigest()
 
 def xt_private_get(path, params=None):
     params = params or {}
     timestamp = str(int(time.time() * 1000))
     query_string = canonical_form(params)
-    signature = calculate_signature(
-        XT_API_KEY, XT_API_SECRET, timestamp, path,
-        query_string=query_string, body_string=""
-    )
+    signature = calculate_signature(XT_API_KEY, XT_API_SECRET, timestamp, path, query_string=query_string, body_string="")
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "xt-validate-appkey": XT_API_KEY,
@@ -112,6 +94,87 @@ def get_xt_positions():
         log.error(f"XT position error: {exc}")
         return []
 
+def get_conditional_orders():
+    """دریافت سفارشات شرطی (استاپ و تی‌پی)"""
+    try:
+        response = xt_private_get("/future/trade/v1/entrust/plan-list", {"state": "NOT_TRIGGERED"})
+        result = response.get("result", {})
+        if isinstance(result, dict):
+            return result.get("items", [])
+        if isinstance(result, list):
+            return result
+        return []
+    except Exception as exc:
+        log.error(f"XT conditional orders error: {exc}")
+        return []
+
+def get_open_orders():
+    """دریافت سفارشات باز معمولی"""
+    try:
+        response = xt_private_get("/future/trade/v1/order/list-open-order", {})
+        result = response.get("result", [])
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            return result.get("list", [])
+        return []
+    except Exception as exc:
+        log.error(f"XT open orders error: {exc}")
+        return []
+
+# ============================================================
+# پیدا کردن استاپ و تی‌پی
+# ============================================================
+
+def find_stop_tp(symbol, side, conditional_orders, open_orders):
+    """
+    پیدا کردن استاپ و تی‌پی برای یه پوزیشن
+    - استاپ از سفارشات شرطی (STOP_MARKET)
+    - تی‌پی از سفارشات باز (LIMIT)
+    """
+    stop = None
+    tp = None
+    symbol_lower = symbol.lower()
+    side_upper = side.upper()
+    
+    # برای LONG: بستن با SELL
+    # برای SHORT: بستن با BUY
+    close_side = "SELL" if side_upper == "LONG" else "BUY"
+    
+    # 1. استاپ از سفارشات شرطی
+    for order in conditional_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol", "")).lower() != symbol_lower:
+            continue
+        if str(order.get("orderSide", "")).upper() != close_side:
+            continue
+        
+        entrust_type = str(order.get("entrustType", "")).upper()
+        if "STOP" in entrust_type:
+            price = order.get("stopPrice")
+            if price:
+                stop = float(price)
+                break
+    
+    # 2. تی‌پی از سفارشات باز (LIMIT)
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("symbol", "")).lower() != symbol_lower:
+            continue
+        if str(order.get("orderSide", "")).upper() != close_side:
+            continue
+        
+        order_type = str(order.get("orderType", "")).upper()
+        if "LIMIT" in order_type:
+            price = order.get("price")
+            if price:
+                tp = float(price)
+                break
+    
+    return stop, tp
+
 # ============================================================
 # تلگرام
 # ============================================================
@@ -121,11 +184,7 @@ def send_telegram(message):
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }, timeout=5)
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
         if r.status_code == 200:
             log.info("✅ Telegram sent")
             return True
@@ -140,25 +199,20 @@ def send_telegram(message):
 # فرمت پیام
 # ============================================================
 
-def format_position_message(pos):
+def format_position_message(pos, stop, tp):
     side = pos.get("positionSide", "UNKNOWN")
     entry = float(pos.get("entryPrice", 0) or 0)
     lev = int(pos.get("leverage", 0) or 0)
     symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
     
-    # ✅ خواندن استاپ و تی‌پی از پوزیشن
-    stop = pos.get("triggerStopPrice")
-    tp = pos.get("triggerProfitPrice")
-    
-    stop_str = f"{float(stop):.2f}" if stop else "0.00"
-    tp_str = f"{float(tp):.2f}" if tp else "0.00"
+    stop_str = f"{stop:.2f}" if stop else "—"
+    tp_str = f"{tp:.2f}" if tp else "—"
     
     side_emoji = "🟢" if side == "LONG" else "🔴"
     direction_text = "لانگ (خرید)" if side == "LONG" else "شورت (فروش)"
     
     now_iran = datetime.now(IRAN_TZ)
     time_str = now_iran.strftime('%Y-%m-%d %H:%M:%S')
-    
     line = "━━━━━━━━━━━━━━━━━━━━━━━━"
     
     return f"""🆕 <b>پوزیشن جدید</b>
@@ -184,10 +238,11 @@ def format_position_message(pos):
 
 def check_once():
     global seen_positions
-    
     try:
         now = time.time()
         positions = get_xt_positions()
+        conditional_orders = get_conditional_orders()
+        open_orders = get_open_orders()
         current_keys = set()
         
         for pos in positions:
@@ -201,10 +256,8 @@ def check_once():
             key = f"{symbol}_{side}"
             current_keys.add(key)
             
-            # ⏰ بررسی زمان با updatedTime
             updated_ms = pos.get("updatedTime")
             age_seconds = None
-            
             if updated_ms:
                 try:
                     ts = int(updated_ms)
@@ -214,22 +267,19 @@ def check_once():
                 except:
                     pass
             
-            log.info(f"🔍 {key} | Entry: {entry} | Age: {age_seconds:.0f}s" if age_seconds else f"🔍 {key} | Entry: {entry} | Age: unknown")
-            
-            # ✅ شرط ارسال
             if key not in seen_positions:
                 if age_seconds is None or age_seconds <= MAX_AGE_SECONDS:
-                    log.info(f"🆕 Fresh: {key} → Sending")
-                    send_telegram(format_position_message(pos))
+                    stop, tp = find_stop_tp(symbol, side, conditional_orders, open_orders)
+                    log.info(f"🆕 {key} | Entry: {entry} | Stop: {stop} | TP: {tp}")
+                    send_telegram(format_position_message(pos, stop, tp))
                     seen_positions.add(key)
                     time.sleep(0.5)
                 else:
-                    log.info(f"⏸️ Old position ({age_seconds:.0f}s), skipping")
+                    log.info(f"⏸️ Old: {key} ({age_seconds:.0f}s)")
                     seen_positions.add(key)
             else:
                 log.info(f"⏸️ Already sent: {key}")
         
-        # 🧹 حذف بسته شده‌ها
         closed = seen_positions - current_keys
         if closed:
             log.info(f"🧹 Closed: {closed}")
