@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-# 🤖 REZA POSITION MONITOR - نسخه نهایی با استاپ/تی‌پی
+# 🤖 REZA POSITION MONITOR - نسخه نهایی
 # ============================================================
 
 import os
@@ -21,10 +21,27 @@ XT_API_KEY = os.getenv("XT_API_KEY", "").strip()
 XT_API_SECRET = os.getenv("XT_API_SECRET", "").strip()
 XT_BASE_URL = "https://fapi.xt.com"
 
-CHECK_INTERVAL = 120
-MAX_AGE_SECONDS = 120
+CHECK_INTERVAL = 30
+MAX_POSITION_AGE = 90
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
+# ============================================================
+# 🎯 استاپ سفارشی برای هر سمبل
+# ============================================================
+
+STOP_OFFSETS = {
+    "ETHUSDT": 12,
+    "BNBUSDT": 12,
+    "BTCUSDT": 450,
+    "HYPEUSDT": 0.7,
+    "LINKUSDT": 0.22,
+    "SOLUSDT": 1.5,
+    "XRPUSDT": 0.04,
+    "ZECUSDT": 15,
+}
+
+# 🧠 حافظه
+START_TIME = time.time()
 seen_positions = set()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -94,86 +111,71 @@ def get_xt_positions():
         log.error(f"XT position error: {exc}")
         return []
 
-def get_conditional_orders():
-    """دریافت سفارشات شرطی (استاپ و تی‌پی)"""
+def get_recent_orders():
     try:
-        response = xt_private_get("/future/trade/v1/entrust/plan-list", {"state": "NOT_TRIGGERED"})
+        response = xt_private_get("/future/trade/v1/order/list-history", {
+            "direction": "NEXT", "limit": 100
+        })
         result = response.get("result", {})
         if isinstance(result, dict):
             return result.get("items", [])
-        if isinstance(result, list):
-            return result
         return []
     except Exception as exc:
-        log.error(f"XT conditional orders error: {exc}")
-        return []
-
-def get_open_orders():
-    """دریافت سفارشات باز معمولی"""
-    try:
-        response = xt_private_get("/future/trade/v1/order/list-open-order", {})
-        result = response.get("result", [])
-        if isinstance(result, list):
-            return result
-        if isinstance(result, dict):
-            return result.get("list", [])
-        return []
-    except Exception as exc:
-        log.error(f"XT open orders error: {exc}")
+        log.error(f"XT history error: {exc}")
         return []
 
 # ============================================================
-# پیدا کردن استاپ و تی‌پی
+# زمان باز شدن پوزیشن
 # ============================================================
 
-def find_stop_tp(symbol, side, conditional_orders, open_orders):
-    """
-    پیدا کردن استاپ و تی‌پی برای یه پوزیشن
-    - استاپ از سفارشات شرطی (STOP_MARKET)
-    - تی‌پی از سفارشات باز (LIMIT)
-    """
-    stop = None
-    tp = None
+def get_position_open_time(symbol, side, history_orders):
     symbol_lower = symbol.lower()
     side_upper = side.upper()
+    entry_side = "BUY" if side_upper == "LONG" else "SELL"
     
-    # برای LONG: بستن با SELL
-    # برای SHORT: بستن با BUY
-    close_side = "SELL" if side_upper == "LONG" else "BUY"
-    
-    # 1. استاپ از سفارشات شرطی
-    for order in conditional_orders:
+    open_time = None
+    for order in history_orders:
         if not isinstance(order, dict):
             continue
         if str(order.get("symbol", "")).lower() != symbol_lower:
             continue
-        if str(order.get("orderSide", "")).upper() != close_side:
+        if str(order.get("orderSide", "")).upper() != entry_side:
+            continue
+        if str(order.get("positionSide", "")).upper() != side_upper:
+            continue
+        if str(order.get("state", "")).upper() not in ("FILLED", "PARTIALLY_FILLED"):
+            continue
+        if float(order.get("executedQty", 0) or 0) <= 0:
             continue
         
-        entrust_type = str(order.get("entrustType", "")).upper()
-        if "STOP" in entrust_type:
-            price = order.get("stopPrice")
-            if price:
-                stop = float(price)
-                break
-    
-    # 2. تی‌پی از سفارشات باز (LIMIT)
-    for order in open_orders:
-        if not isinstance(order, dict):
-            continue
-        if str(order.get("symbol", "")).lower() != symbol_lower:
-            continue
-        if str(order.get("orderSide", "")).upper() != close_side:
-            continue
-        
-        order_type = str(order.get("orderType", "")).upper()
-        if "LIMIT" in order_type:
-            price = order.get("price")
-            if price:
-                tp = float(price)
-                break
-    
-    return stop, tp
+        created_ms = order.get("createdTime")
+        if created_ms:
+            try:
+                ts = int(created_ms)
+                if ts > 1e12:
+                    ts = ts / 1000
+                if open_time is None or ts > open_time:
+                    open_time = ts
+            except:
+                continue
+    return open_time
+
+# ============================================================
+# محاسبه استاپ سفارشی
+# ============================================================
+
+def calculate_stop(symbol, side, entry):
+    """
+    - LONG: entry - offset
+    - SHORT: entry + offset
+    """
+    offset = STOP_OFFSETS.get(symbol.upper())
+    if offset is None:
+        return None
+    if side.upper() == "LONG":
+        return entry - offset
+    else:
+        return entry + offset
 
 # ============================================================
 # تلگرام
@@ -185,28 +187,22 @@ def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
-        if r.status_code == 200:
-            log.info("✅ Telegram sent")
-            return True
-        else:
-            log.error(f"❌ Telegram error: {r.text}")
-            return False
-    except Exception as e:
-        log.error(f"❌ Telegram exception: {e}")
+        return r.status_code == 200
+    except:
         return False
 
 # ============================================================
 # فرمت پیام
 # ============================================================
 
-def format_position_message(pos, stop, tp):
+def format_position_message(pos):
     side = pos.get("positionSide", "UNKNOWN")
     entry = float(pos.get("entryPrice", 0) or 0)
     lev = int(pos.get("leverage", 0) or 0)
     symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
     
+    stop = calculate_stop(symbol, side, entry)
     stop_str = f"{stop:.2f}" if stop else "—"
-    tp_str = f"{tp:.2f}" if tp else "—"
     
     side_emoji = "🟢" if side == "LONG" else "🔴"
     direction_text = "لانگ (خرید)" if side == "LONG" else "شورت (فروش)"
@@ -223,11 +219,12 @@ def format_position_message(pos, stop, tp):
 
 💰 <b>قیمت ورود:</b>  <code>{entry:.2f}</code> USDT
 🛑 <b>حد ضرر:</b>  <code>{stop_str}</code> USDT
-🎯 <b>حد سود:</b>  <code>{tp_str}</code> USDT
+🎯 <b>حد سود:</b>  <b>Scalp</b>
 📦 <b>حجم:</b>  <i>دلخواه با مدیریت سرمایه</i>
 ⚡ <b>اهرم:</b>  <code>{lev}x</code>
-📈 <b>سود/زیان:</b>  <b>1.5 سود / 1 ضرر به نسبت</b>
 
+{line}
+⚠️ <i>پوزیشن اسکلپ را در سود مناسب ببندید احتمال برگشت قیمت وجود دارد</i>
 {line}
 🕐 <code>{time_str}</code>
 📌 <i>مدیریت سرمایه و پوزیشن با شماست</i>"""
@@ -241,8 +238,7 @@ def check_once():
     try:
         now = time.time()
         positions = get_xt_positions()
-        conditional_orders = get_conditional_orders()
-        open_orders = get_open_orders()
+        history_orders = get_recent_orders()
         current_keys = set()
         
         for pos in positions:
@@ -252,40 +248,30 @@ def check_once():
             
             symbol = pos.get("symbol", "UNKNOWN").upper().replace("_", "")
             side = pos.get("positionSide", "UNKNOWN")
-            entry = float(pos.get("entryPrice", 0) or 0)
             key = f"{symbol}_{side}"
             current_keys.add(key)
             
-            updated_ms = pos.get("updatedTime")
-            age_seconds = None
-            if updated_ms:
-                try:
-                    ts = int(updated_ms)
-                    if ts > 1e12:
-                        ts = ts / 1000
-                    age_seconds = now - ts
-                except:
-                    pass
+            if key in seen_positions:
+                continue
             
-            if key not in seen_positions:
-                if age_seconds is None or age_seconds <= MAX_AGE_SECONDS:
-                    stop, tp = find_stop_tp(symbol, side, conditional_orders, open_orders)
-                    log.info(f"🆕 {key} | Entry: {entry} | Stop: {stop} | TP: {tp}")
-                    send_telegram(format_position_message(pos, stop, tp))
-                    seen_positions.add(key)
-                    time.sleep(0.5)
-                else:
-                    log.info(f"⏸️ Old: {key} ({age_seconds:.0f}s)")
-                    seen_positions.add(key)
-            else:
-                log.info(f"⏸️ Already sent: {key}")
+            open_time = get_position_open_time(symbol, side, history_orders)
+            if open_time is None:
+                seen_positions.add(key)
+                continue
+            
+            position_age = now - open_time
+            if position_age > MAX_POSITION_AGE or open_time < START_TIME:
+                seen_positions.add(key)
+                continue
+            
+            log.info(f"🆕 Sending: {key} | Age: {position_age:.0f}s")
+            send_telegram(format_position_message(pos))
+            seen_positions.add(key)
+            time.sleep(0.3)
         
-        closed = seen_positions - current_keys
-        if closed:
-            log.info(f"🧹 Closed: {closed}")
-            seen_positions -= closed
+        seen_positions -= (seen_positions - current_keys)
         
-        log.info(f"📊 Active: {len(current_keys)} | Memory: {len(seen_positions)}")
+        log.info(f"📊 Active: {len(current_keys)} | Sent: {len(seen_positions)}")
         
     except Exception as exc:
         log.error(f"❌ Error: {exc}")
@@ -295,13 +281,12 @@ def check_once():
 # ============================================================
 
 def main():
-    log.info("🚀 Starting monitor...")
+    log.info(f"🚀 Starting monitor | START_TIME={START_TIME}")
     while True:
         try:
             check_once()
         except Exception as exc:
             log.error(f"❌ Loop error: {exc}")
-        log.info(f"⏳ Sleeping {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
